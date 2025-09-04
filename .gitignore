@@ -1,0 +1,32 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Secure configuration files
+app/src/main/assets/config.json
+
+# Cache files
+*.m3u
+*.xml
+EPG.xml
+
+# APK files
+*.apk
+
+# Android Studio IDE files
+.idea/
+
+# Gradle build outputs
+app/build/

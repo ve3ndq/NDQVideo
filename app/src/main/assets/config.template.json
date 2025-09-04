@@ -1,0 +1,4 @@
+{
+  "m3u_url": "http://your-iptv-server.com/get.php?username=YOUR_USERNAME&password=YOUR_PASSWORD&type=m3u&output=mpegts",
+  "epg_url": "http://your-iptv-server.com/epg.php?username=YOUR_USERNAME&password=YOUR_PASSWORD"
+}
