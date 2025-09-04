@@ -45,6 +45,235 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// Data class for debug information
+data class DebugInfo(
+    val m3uChannels: List<String> = emptyList(),
+    val epgPrograms: List<String> = emptyList(),
+    val searchTerm: String = ""
+)
+
+// Data class for EPG statistics
+data class EpgStats(
+    val totalChunks: Int = 0,
+    val totalSize: Long = 0,
+    val favoriteChannelsWithPrograms: Int = 0,
+    val totalProgramsForFavorites: Int = 0,
+    val lastUpdated: String = "",
+    val chunkDetails: List<ChunkInfo> = emptyList()
+)
+
+data class ChunkInfo(
+    val fileName: String,
+    val size: Long,
+    val programCount: Int = 0
+)
+
+// Function to normalize channel names by removing common prefixes
+fun normalizeChannelName(channelName: String): String {
+    return channelName
+        .trim()
+        .removePrefix("CA:")
+        .removePrefix("US:")
+        .removePrefix("CA-S:")
+        .removePrefix("UK:")
+        .removePrefix("EU:")
+        .removePrefix("ASIA:")
+        .removePrefix("AU:")
+        .removePrefix("LAT:")
+        .trim()
+}
+
+// Function to get debug information for channel matching
+suspend fun getDebugInfo(context: Context, searchTerm: String = "CTV Toronto"): DebugInfo {
+    return withContext(Dispatchers.IO) {
+        val m3uChannels = mutableListOf<String>()
+        val epgPrograms = mutableListOf<String>()
+
+        // Search M3U channels
+        try {
+            val m3uFile = File(context.filesDir, "channels.m3u")
+            if (m3uFile.exists()) {
+                m3uFile.readLines().forEach { line ->
+                    if (line.contains(searchTerm, ignoreCase = true)) {
+                        m3uChannels.add(line.trim())
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            m3uChannels.add("Error reading M3U file: ${e.message}")
+        }
+
+        // Search EPG programs
+        try {
+            val epgDir = File(context.filesDir, "epg_chunks")
+            if (epgDir.exists()) {
+                epgDir.listFiles()?.filter { it.name.endsWith(".xml") }?.forEach { chunkFile ->
+                    try {
+                        chunkFile.bufferedReader().use { reader ->
+                            var line: String?
+                            while (reader.readLine().also { line = it } != null) {
+                                val lineStr = line ?: ""
+                                if (lineStr.contains(searchTerm, ignoreCase = true)) {
+                                    epgPrograms.add(lineStr.trim())
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // Skip problematic chunks
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            epgPrograms.add("Error reading EPG chunks: ${e.message}")
+        }
+
+        DebugInfo(
+            m3uChannels = m3uChannels,
+            epgPrograms = epgPrograms,
+            searchTerm = searchTerm
+        )
+    }
+}
+
+// Function to analyze EPG chunks and count programs for favorite channels
+suspend fun analyzeEpgChunks(context: Context, favoriteChannels: Set<String>): EpgStats {
+    return withContext(Dispatchers.IO) {
+        val epgDir = File(context.filesDir, "epg_chunks")
+        if (!epgDir.exists()) {
+            return@withContext EpgStats()
+        }
+
+        val chunkFiles = epgDir.listFiles()?.filter { it.name.endsWith(".xml") }?.sortedBy { it.name } ?: emptyList()
+        val totalSize = chunkFiles.sumOf { it.length() }
+        val dateFormat = SimpleDateFormat("MMM dd, yyyy HH:mm:ss", Locale.getDefault())
+
+        val chunkDetails = mutableListOf<ChunkInfo>()
+        var totalProgramsForFavorites = 0
+        var favoriteChannelsWithPrograms = 0
+
+        // Create normalized versions of favorite channels for better matching
+        val normalizedFavorites = favoriteChannels.map { normalizeChannelName(it) }.toSet()
+
+        for (chunkFile in chunkFiles) {
+            var programCount = 0
+            var favoriteProgramsInChunk = 0
+
+            try {
+                chunkFile.bufferedReader().use { reader ->
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        val lineStr = line ?: ""
+                        if (lineStr.contains("<programme")) {
+                            programCount++
+
+                            // Check if this program is for a favorite channel using normalized names
+                            for (normalizedFavorite in normalizedFavorites) {
+                                if (lineStr.contains("channel=\"$normalizedFavorite\"") ||
+                                    lineStr.contains("channel=\"${normalizedFavorite.replace(":", "")}\"")) {
+                                    favoriteProgramsInChunk++
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Skip problematic chunks
+            }
+
+            chunkDetails.add(ChunkInfo(
+                fileName = chunkFile.name,
+                size = chunkFile.length(),
+                programCount = programCount
+            ))
+
+            totalProgramsForFavorites += favoriteProgramsInChunk
+        }
+
+        // Count unique favorite channels that have programs using normalized matching
+        val channelsWithPrograms = mutableSetOf<String>()
+        for (chunkFile in chunkFiles) {
+            try {
+                chunkFile.bufferedReader().use { reader ->
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        val lineStr = line ?: ""
+                        if (lineStr.contains("<programme")) {
+                            for (normalizedFavorite in normalizedFavorites) {
+                                if (lineStr.contains("channel=\"$normalizedFavorite\"") ||
+                                    lineStr.contains("channel=\"${normalizedFavorite.replace(":", "")}\"")) {
+                                    // Find the original favorite channel name that matches this normalized version
+                                    val originalFavorite = favoriteChannels.find { normalizeChannelName(it) == normalizedFavorite }
+                                    if (originalFavorite != null) {
+                                        channelsWithPrograms.add(originalFavorite)
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Skip problematic chunks
+            }
+        }
+
+        EpgStats(
+            totalChunks = chunkFiles.size,
+            totalSize = totalSize,
+            favoriteChannelsWithPrograms = channelsWithPrograms.size,
+            totalProgramsForFavorites = totalProgramsForFavorites,
+            lastUpdated = dateFormat.format(Date(epgDir.lastModified())),
+            chunkDetails = chunkDetails
+        )
+    }
+}
+
+// Function to download and split EPG file into chunks
+suspend fun downloadAndSplitEpgFile(inputStream: java.io.InputStream, context: Context, maxChunkSize: Long) {
+    withContext(Dispatchers.IO) {
+        val epgDir = File(context.filesDir, "epg_chunks")
+
+        // Clean up old chunks
+        if (epgDir.exists()) {
+            epgDir.deleteRecursively()
+        }
+        epgDir.mkdirs()
+
+        val buffer = ByteArray(8192)
+        var bytesRead: Int
+        var totalBytesRead = 0L
+        var chunkIndex = 0
+        var currentChunkSize = 0L
+
+        var currentOutputStream: java.io.FileOutputStream? = null
+        var currentChunkFile: File? = null
+
+        try {
+            inputStream.use { input ->
+                while (input.read(buffer).also { bytesRead = it } != -1) {
+                    // Create new chunk if needed
+                    if (currentOutputStream == null || currentChunkSize >= maxChunkSize) {
+                        currentOutputStream?.close()
+
+                        currentChunkFile = File(epgDir, "epg_chunk_${chunkIndex.toString().padStart(3, '0')}.xml")
+                        currentOutputStream = java.io.FileOutputStream(currentChunkFile)
+                        currentChunkSize = 0L
+                        chunkIndex++
+                    }
+
+                    // Write to current chunk
+                    currentOutputStream?.write(buffer, 0, bytesRead)
+                    currentChunkSize += bytesRead
+                    totalBytesRead += bytesRead
+                }
+            }
+        } finally {
+            currentOutputStream?.close()
+        }
+    }
+}
+
 @Composable
 fun IPTVGroupsScreen(modifier: Modifier = Modifier) {
     var groups by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -58,6 +287,8 @@ fun IPTVGroupsScreen(modifier: Modifier = Modifier) {
     var refreshTrigger by remember { mutableStateOf(0) }
     var epgRefreshTrigger by remember { mutableStateOf(0) }
     var epgTimestamp by remember { mutableStateOf<String?>(null) }
+    var epgStats by remember { mutableStateOf<EpgStats?>(null) }
+    var debugInfo by remember { mutableStateOf<DebugInfo?>(null) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -110,6 +341,27 @@ fun IPTVGroupsScreen(modifier: Modifier = Modifier) {
     // Function to refresh EPG file
     fun refreshEPG() {
         epgRefreshTrigger++
+    }
+
+    // Function to refresh EPG stats
+    fun refreshEpgStats() {
+        scope.launch {
+            epgStats = analyzeEpgChunks(context, favorites)
+        }
+    }
+
+    // Function to refresh debug info
+    fun refreshDebugInfo() {
+        scope.launch {
+            debugInfo = getDebugInfo(context, "CTV Toronto")
+        }
+    }
+
+    // Load EPG stats when favorites change or on initial load
+    LaunchedEffect(favorites, epgRefreshTrigger) {
+        if (favorites.isNotEmpty() || epgRefreshTrigger > 0) {
+            refreshEpgStats()
+        }
     }
 
     LaunchedEffect(refreshTrigger) {
@@ -209,46 +461,40 @@ fun IPTVGroupsScreen(modifier: Modifier = Modifier) {
                     val connection = epgUrl.openConnection()
                     val inputStream = connection.getInputStream()
 
-                    // Check content length to avoid memory issues
+                    // Check content length - allow larger files now that we can split them
                     val contentLength = connection.contentLength
-                    if (contentLength > 50 * 1024 * 1024) { // 50MB limit
-                        progressMessage = "EPG file too large (${contentLength / 1024 / 1024}MB). Skipping download."
-                        epgTimestamp = "EPG: File too large (${contentLength / 1024 / 1024}MB)"
-                        return@withContext
+                    val maxChunkSize = 25 * 1024 * 1024L // 25MB chunks
+
+                    if (contentLength > 0) {
+                        val numChunks = (contentLength + maxChunkSize - 1) / maxChunkSize
+                        progressMessage = "EPG file size: ${contentLength / 1024 / 1024}MB. Will split into $numChunks chunks."
                     }
 
-                    // Read with progress tracking - write directly to file to avoid memory issues
-                    var bytesRead = 0L
-                    val buffer = ByteArray(8192)
-                    var bytes: Int
+                    // Download and split the file into chunks
+                    downloadAndSplitEpgFile(inputStream, context, maxChunkSize)
 
-                    epgFile.outputStream().use { output ->
-                        inputStream.use { input ->
-                            while (input.read(buffer).also { bytes = it } != -1) {
-                                output.write(buffer, 0, bytes)
-                                bytesRead += bytes
-                                progressMessage = "Downloading EPG... ${bytesRead / 1024} KB received"
-                            }
-                        }
-                    }
-
-                    progressMessage = "Downloaded EPG file (${bytesRead / 1024} KB). File saved."
+                    progressMessage = "EPG file downloaded and split into chunks."
                 } else {
-                    // Check file size before attempting to read
-                    val fileSize = epgFile.length()
-                    if (fileSize > 50 * 1024 * 1024) { // 50MB limit
-                        progressMessage = "EPG file too large (${fileSize / 1024 / 1024}MB). Skipping load."
-                        epgTimestamp = "EPG: File too large (${fileSize / 1024 / 1024}MB)"
-                        return@withContext
+                    // Check if we have EPG chunks
+                    val epgDir = File(context.filesDir, "epg_chunks")
+                    if (epgDir.exists() && epgDir.listFiles()?.isNotEmpty() == true) {
+                        val chunkCount = epgDir.listFiles()?.size ?: 0
+                        progressMessage = "Loaded EPG from cache ($chunkCount chunks)."
+                    } else {
+                        progressMessage = "No EPG data available."
                     }
-
-                    progressMessage = "Loaded EPG from cache (${fileSize / 1024} KB)."
                 }
 
                 // Format and store the EPG file timestamp
                 val dateFormat = SimpleDateFormat("MMM dd, yyyy HH:mm:ss", Locale.getDefault())
-                val fileSize = epgFile.length()
-                epgTimestamp = "EPG file: ${dateFormat.format(Date(epgFile.lastModified()))} (${fileSize / 1024} KB)"
+                val epgDir = File(context.filesDir, "epg_chunks")
+                if (epgDir.exists()) {
+                    val chunkFiles = epgDir.listFiles() ?: emptyArray()
+                    val totalSize = chunkFiles.sumOf { it.length() }
+                    epgTimestamp = "EPG chunks: ${dateFormat.format(Date(epgDir.lastModified()))} (${chunkFiles.size} files, ${totalSize / 1024} KB)"
+                } else {
+                    epgTimestamp = "EPG: No chunks available"
+                }
 
             } catch (e: Exception) {
                 // EPG loading failed, but don't block the app
@@ -265,22 +511,68 @@ fun IPTVGroupsScreen(modifier: Modifier = Modifier) {
     } else {
         Box(modifier = modifier.fillMaxSize()) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // Header
+                // Header with stats
                 Row(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                    Text(
-                        text = "Favorites",
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable { currentView = "favorites" }
-                            .padding(8.dp)
-                    )
-                    Text(
-                        text = "Groups",
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable { currentView = "groups" }
-                            .padding(8.dp)
-                    )
+                    // Main navigation tabs
+                    Row(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Favorites",
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { currentView = "favorites" }
+                                .padding(8.dp)
+                        )
+                        Text(
+                            text = "Groups",
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { currentView = "groups" }
+                                .padding(8.dp)
+                        )
+                        Text(
+                            text = "EPG Info",
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    currentView = "epg_info"
+                                    refreshEpgStats()
+                                }
+                                .padding(8.dp)
+                        )
+                        Text(
+                            text = "Debug",
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    currentView = "debug"
+                                    refreshDebugInfo()
+                                }
+                                .padding(8.dp)
+                        )
+                    }
+
+                    // Stats in top right corner
+                    if (epgTimestamp != null || fileTimestamp != null) {
+                        Column(
+                            modifier = Modifier.padding(start = 16.dp),
+                            horizontalAlignment = Alignment.End
+                        ) {
+                            if (epgTimestamp != null) {
+                                Text(
+                                    text = epgTimestamp!!,
+                                    style = androidx.tv.material3.MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.clickable { refreshEPG() }
+                                )
+                            }
+                            if (fileTimestamp != null) {
+                                Text(
+                                    text = fileTimestamp!!,
+                                    style = androidx.tv.material3.MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.clickable { refreshM3U() }
+                                )
+                            }
+                        }
+                    }
                 }
                 // Main content
                 if (currentView == "groups") {
@@ -344,6 +636,151 @@ fun IPTVGroupsScreen(modifier: Modifier = Modifier) {
                             }
                         }
                     }
+                } else if (currentView == "epg_info") {
+                    // EPG Info view
+                    @OptIn(ExperimentalTvMaterial3Api::class)
+                    LazyColumn(modifier = Modifier.weight(1f).fillMaxSize().padding(16.dp)) {
+                        item {
+                            Text(
+                                text = "EPG Information",
+                                style = androidx.tv.material3.MaterialTheme.typography.headlineMedium
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                        }
+
+                        if (epgStats == null) {
+                            item {
+                                Text("Loading EPG statistics...")
+                                androidx.tv.material3.Button(
+                                    onClick = { refreshEpgStats() },
+                                    modifier = Modifier.padding(top = 8.dp)
+                                ) {
+                                    Text("Refresh Stats")
+                                }
+                            }
+                        } else {
+                            val stats = epgStats!!
+                            item {
+                                Text("📊 EPG Overview", style = androidx.tv.material3.MaterialTheme.typography.titleMedium)
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            item {
+                                Text("Total Chunks: ${stats.totalChunks}")
+                                Text("Total Size: ${stats.totalSize / 1024} KB")
+                                Text("Last Updated: ${stats.lastUpdated}")
+                                Spacer(modifier = Modifier.height(16.dp))
+                            }
+
+                            item {
+                                Text("📺 Favorite Channels", style = androidx.tv.material3.MaterialTheme.typography.titleMedium)
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            item {
+                                Text("Channels with Programs: ${stats.favoriteChannelsWithPrograms}")
+                                Text("Total Programs: ${stats.totalProgramsForFavorites}")
+                                Spacer(modifier = Modifier.height(16.dp))
+                            }
+
+                            item {
+                                Text("📁 Chunk Details", style = androidx.tv.material3.MaterialTheme.typography.titleMedium)
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            items(stats.chunkDetails) { chunk ->
+                                Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                    Text("📄 ${chunk.fileName}")
+                                    Text("   Size: ${chunk.size / 1024} KB, Programs: ${chunk.programCount}",
+                                        style = androidx.tv.material3.MaterialTheme.typography.bodySmall)
+                                }
+                            }
+
+                            item {
+                                Spacer(modifier = Modifier.height(16.dp))
+                                androidx.tv.material3.Button(onClick = { refreshEpgStats() }) {
+                                    Text("Refresh Stats")
+                                }
+                            }
+                        }
+                    }
+                } else if (currentView == "debug") {
+                    // Debug view
+                    @OptIn(ExperimentalTvMaterial3Api::class)
+                    LazyColumn(modifier = Modifier.weight(1f).fillMaxSize().padding(16.dp)) {
+                        item {
+                            Text(
+                                text = "Debug Information",
+                                style = androidx.tv.material3.MaterialTheme.typography.headlineMedium
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                        }
+
+                        if (debugInfo == null) {
+                            item {
+                                Text("Loading debug information...")
+                                androidx.tv.material3.Button(
+                                    onClick = { refreshDebugInfo() },
+                                    modifier = Modifier.padding(top = 8.dp)
+                                ) {
+                                    Text("Refresh Debug Info")
+                                }
+                            }
+                        } else {
+                            val debug = debugInfo!!
+                            item {
+                                Text("🔍 Searching for: \"${debug.searchTerm}\"", style = androidx.tv.material3.MaterialTheme.typography.titleMedium)
+                                Spacer(modifier = Modifier.height(16.dp))
+                            }
+
+                            item {
+                                Text("📺 M3U Channels (${debug.m3uChannels.size} found)", style = androidx.tv.material3.MaterialTheme.typography.titleMedium)
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            if (debug.m3uChannels.isEmpty()) {
+                                item {
+                                    Text("No M3U channels found containing \"${debug.searchTerm}\"")
+                                }
+                            } else {
+                                items(debug.m3uChannels) { channel ->
+                                    Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                        Text(channel, style = androidx.tv.material3.MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            }
+
+                            item {
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text("📡 EPG Programs (${debug.epgPrograms.size} found)", style = androidx.tv.material3.MaterialTheme.typography.titleMedium)
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            if (debug.epgPrograms.isEmpty()) {
+                                item {
+                                    Text("No EPG programs found containing \"${debug.searchTerm}\"")
+                                }
+                            } else {
+                                items(debug.epgPrograms.take(50)) { program -> // Limit to first 50 for performance
+                                    Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                        Text(program, style = androidx.tv.material3.MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                                if (debug.epgPrograms.size > 50) {
+                                    item {
+                                        Text("... and ${debug.epgPrograms.size - 50} more programs", style = androidx.tv.material3.MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            }
+
+                            item {
+                                Spacer(modifier = Modifier.height(16.dp))
+                                androidx.tv.material3.Button(onClick = { refreshDebugInfo() }) {
+                                    Text("Refresh Debug Info")
+                                }
+                            }
+                        }
+                    }
                 } else {
                     // Favorites view
                     val favoriteChannels = groupChannels.values.flatten().filter { it.first in favorites }
@@ -390,28 +827,6 @@ fun IPTVGroupsScreen(modifier: Modifier = Modifier) {
                             }
                         }
                     }
-                }
-            }
-
-            // Timestamps at bottom
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(16.dp)
-            ) {
-                if (epgTimestamp != null) {
-                    Text(
-                        text = epgTimestamp!!,
-                        modifier = Modifier
-                            .padding(bottom = 4.dp)
-                            .clickable { refreshEPG() }
-                    )
-                }
-                if (fileTimestamp != null) {
-                    Text(
-                        text = fileTimestamp!!,
-                        modifier = Modifier.clickable { refreshM3U() }
-                    )
                 }
             }
         }
